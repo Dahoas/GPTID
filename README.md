@@ -1,4 +1,4 @@
-# GPTID
+#:wqPTID
 Official code repository for article Intrinsic Dimension Estimation for Robust Detection of AI-Generated Texts. 
 
 <i> We apologize --- it is under construction, for now. </i>

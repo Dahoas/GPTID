@@ -21,7 +21,7 @@ from skdim.id import MLE
 
 from tqdm import tqdm
 
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel, AutoTokenizer, AutoConfig
 from datasets import load_dataset
 
 from util import load_data
@@ -35,9 +35,10 @@ LOG_EMBEDDINGS = False
 
 def get_embeddings(texts: List[str], 
                    tokenizer, 
-                   model,):
-    embedding_list = []
-    log_list = []
+                   model,
+                   layers=[-1],) -> dict[int, list[torch.tensor]]:
+    embedding_list = {layer: [] for layer in layers}
+    log_list = {layer: [] for layer in layers}
     num_batches = (len(texts) + batch_size - 1) // batch_size
     batches = [texts[i*batch_size:(i+1)*batch_size] for i in range(num_batches)]
     for i, batch in tqdm(enumerate(batches)):
@@ -45,20 +46,23 @@ def get_embeddings(texts: List[str],
         inputs["input_ids"] = inputs["input_ids"].to(device)
         inputs["attention_mask"] = inputs["attention_mask"].to(device)
         with torch.no_grad():
-            embeddings = model(**inputs)[0].cpu()
-            log_list.append(embeddings)
-            # Remove EOS tokens
-            mask = inputs["input_ids"] != tokenizer.eos_token_id
-            for m, embedding in zip(mask, embeddings):
-                embedding = embedding[:m.sum()]
-                embedding_list.append(embedding)
-            if len(log_list) >= log_size and LOG_EMBEDDINGS:
-                log_embeddings = torch.cat(log_list, dim=0)
-                torch.save(log_embeddings, os.path.join(log_folder, f"embeddings_{i}.pt"))
-                log_list = []
-    if len(log_list) > 0 and LOG_EMBEDDINGS:
-        log_embeddings = torch.cat(log_list, dim=0)
-        torch.save(log_embeddings, os.path.join(log_folder, f"embeddings_{i+1}.pt"))
+            hidden_states = model(**inputs, output_hidden_states=True).hidden_states
+            for layer in layers:
+                embeddings = hidden_states[layer].cpu()
+                log_list[layer].append(embeddings)
+                # Remove EOS tokens
+                mask = inputs["input_ids"] != tokenizer.eos_token_id
+                for m, embedding in zip(mask, embeddings):
+                    embedding = embedding[:m.sum()]
+                    embedding_list[layer].append(embedding)
+                if len(log_list[layer]) >= log_size and LOG_EMBEDDINGS:
+                    log_embeddings = torch.cat(log_list[layer], dim=0)
+                    torch.save(log_embeddings, os.path.join(log_folder, f"embeddings_layer_{layer}_{i}.pt"))
+                    log_list[layer] = []
+    for layer in layers:
+        if len(log_list[layer]) > 0 and LOG_EMBEDDINGS:
+            log_embeddings = torch.cat(log_list[layer], dim=0)
+            torch.save(log_embeddings, os.path.join(log_folder, f"embeddings_layer_{layer}_{i+1}.pt"))
     return embedding_list
 
 def get_stats(nums: List[float]):
@@ -93,6 +97,7 @@ def get_mle(samples: List[torch.tensor], K=5, mode="mean",):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", default="gpt2")
+    parser.add_argument("--layers", default=[-1], nargs="+", type=int)
     parser.add_argument("--dataset_path", default="roneneldan/TinyStories")
     parser.add_argument("--dataset_mode", default="hf")
     parser.add_argument("--split", default="train")
@@ -116,9 +121,17 @@ if __name__ == "__main__":
     tokenizer.padding_side = "right"
     texts = load_data(args.dataset_path, mode=args.dataset_mode)[args.split]["text"][args.dataset_lower:args.dataset_upper]
     
-    embeddings = get_embeddings(texts, tokenizer, model)
-    int_dim, mles, stats = get_mle(embeddings, mode=args.mle_mode, K=args.K)
-    print("Intrinsic dim: ", int_dim)
-    print(json.dumps(stats, indent=2))
+    config = AutoConfig.from_pretrained(args.model_path)
+    if args.layers[-1] > config.num_hidden_layers:
+        args.layers = [i for i in range(config.num_hidden_layers)]
+    
+    embeddings = get_embeddings(texts, tokenizer, model, layers=args.layers)
+    all_stats = dict()
+    for layer, layer_embeddings in embeddings.items():
+        int_dim, mles, stats = get_mle(layer_embeddings, mode=args.mle_mode, K=args.K)
+        print("Layer: ", layer)
+        print("Intrinsic dim: ", int_dim)
+        print(json.dumps(stats, indent=2))
+        all_stats[layer] = stats
     with open(os.path.join(log_folder, "stats.json"), "w") as f:
-        json.dump(stats, f, indent=2)
+        json.dump(all_stats, f, indent=2)
